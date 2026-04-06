@@ -8,6 +8,7 @@ Prometheus exporter for the [GARDENA smart system API](https://docs.developer.hu
 - [Status](#status)
 - [Application Setup](#application-setup)
 - [Running the Exporter](#running-the-exporter)
+- [Finding Valve IDs](#finding-valve-ids)
 - [Estimated Water Usage](#estimated-water-usage)
 - [Metrics](#metrics)
 - [Grafana Dashboard](#grafana-dashboard)
@@ -133,6 +134,36 @@ The exporter serves:
 - `GET /` for a short status page
 - `GET /healthz` for a health check
 - `GET /metrics` for Prometheus metrics
+
+## Finding Valve IDs
+
+To map Gardena valve `service_id` values to the names you see in the app, use `list-valves`.
+
+With Nix:
+
+```bash
+nix run . -- list-valves \
+  --application-key "$GARDENA_APPLICATION_KEY" \
+  --application-secret "$GARDENA_APPLICATION_SECRET"
+```
+
+Without Nix:
+
+```bash
+cargo run -- list-valves \
+  --application-key "$GARDENA_APPLICATION_KEY" \
+  --application-secret "$GARDENA_APPLICATION_SECRET"
+```
+
+If you have more than one Gardena location, pass `--location-id`.
+
+The output is tab-separated:
+
+```text
+location_id	location	device_id	controller_name	service_id	valve_name
+```
+
+That makes it easy to copy the `service_id` values into `estimatedFlowLitersPerMinuteByValve` on NixOS or into repeated `--valve-estimated-flow-liters-per-minute SERVICE_ID=LPM` flags.
 
 ## Estimated Water Usage
 

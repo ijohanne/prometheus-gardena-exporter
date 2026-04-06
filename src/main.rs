@@ -28,6 +28,7 @@ enum Command {
     FetchToken(FetchTokenArgs),
     PrintTokenCurl(PrintTokenCurlArgs),
     ListLocations(ListLocationsArgs),
+    ListValves(ListValvesArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -102,6 +103,18 @@ struct ListLocationsArgs {
     auth: AuthArgs,
 }
 
+#[derive(Debug, Args)]
+struct ListValvesArgs {
+    #[arg(long, env = "GARDENA_LOCATION_ID")]
+    location_id: Option<String>,
+
+    #[arg(long, default_value = DEFAULT_API_URL)]
+    api_url: String,
+
+    #[command(flatten)]
+    auth: AuthArgs,
+}
+
 #[derive(Debug, Clone)]
 struct ValveFlowOverride {
     service_id: String,
@@ -159,6 +172,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::ListLocations(args) => list_locations_command(args, http_client).await,
+        Command::ListValves(args) => list_valves_command(args, http_client).await,
     }
 }
 
@@ -269,6 +283,35 @@ async fn list_locations_command(args: ListLocationsArgs, http_client: Client) ->
 
     for location in locations {
         println!("{}\t{}", location.id, location.name);
+    }
+
+    Ok(())
+}
+
+async fn list_valves_command(args: ListValvesArgs, http_client: Client) -> Result<()> {
+    let valves = gardena::list_valves(
+        &http_client,
+        &AuthConfig {
+            application_key: args.auth.application_key,
+            application_secret: args.auth.application_secret,
+            auth_url: args.auth.auth_url,
+        },
+        &args.api_url,
+        args.location_id.as_deref(),
+    )
+    .await?;
+
+    println!("location_id\tlocation\tdevice_id\tcontroller_name\tservice_id\tvalve_name");
+    for valve in valves {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            valve.location_id,
+            valve.location_name,
+            valve.device_id,
+            valve.controller_name,
+            valve.service_id,
+            valve.valve_name,
+        );
     }
 
     Ok(())

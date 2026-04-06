@@ -115,6 +115,16 @@ pub struct LocationSummary {
     pub name: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ValveSummary {
+    pub location_id: String,
+    pub location_name: String,
+    pub device_id: String,
+    pub controller_name: String,
+    pub service_id: String,
+    pub valve_name: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ExporterState {
     pub location_id: Option<String>,
@@ -238,6 +248,71 @@ pub async fn list_locations(client: &Client, auth: &AuthConfig) -> Result<Vec<Lo
         .await?
         .ok_or_else(|| anyhow!("listing locations unexpectedly returned unauthorized"))?;
     Ok(locations)
+}
+
+pub async fn list_valves(
+    client: &Client,
+    auth: &AuthConfig,
+    api_url: &str,
+    configured_location_id: Option<&str>,
+) -> Result<Vec<ValveSummary>> {
+    let mut token = ActiveToken::from_response(fetch_token(client, auth).await?);
+    let locations = list_locations_with_token(client, auth, &token)
+        .await?
+        .ok_or_else(|| anyhow!("listing locations unexpectedly returned unauthorized"))?;
+    let selected = select_location(&locations, configured_location_id)?;
+
+    let snapshot = if let Some(snapshot) =
+        fetch_snapshot_by_api_url_with_token(client, auth, api_url, &token, &selected.id).await?
+    {
+        snapshot
+    } else {
+        token = ActiveToken::from_response(fetch_token(client, auth).await?);
+        fetch_snapshot_by_api_url_with_token(client, auth, api_url, &token, &selected.id)
+            .await?
+            .ok_or_else(|| anyhow!("snapshot still returned unauthorized after refreshing token"))?
+    };
+
+    let mut state = ExporterState::default();
+    state.apply_snapshot(&selected, &snapshot, None, &BTreeMap::new());
+
+    let mut valves = Vec::new();
+    for device in state.devices.values() {
+        let controller_name = device
+            .common
+            .as_ref()
+            .and_then(|service| service.name.as_deref())
+            .unwrap_or(&device.id)
+            .to_string();
+
+        for valve in device.valves.values() {
+            valves.push(ValveSummary {
+                location_id: selected.id.clone(),
+                location_name: selected.name.clone(),
+                device_id: device.id.clone(),
+                controller_name: controller_name.clone(),
+                service_id: valve.id.clone(),
+                valve_name: valve.name.clone().unwrap_or_else(|| valve.id.clone()),
+            });
+        }
+    }
+
+    valves.sort_by(|left, right| {
+        (
+            &left.location_name,
+            &left.controller_name,
+            &left.valve_name,
+            &left.service_id,
+        )
+            .cmp(&(
+                &right.location_name,
+                &right.controller_name,
+                &right.valve_name,
+                &right.service_id,
+            ))
+    });
+
+    Ok(valves)
 }
 
 pub async fn validate_startup(
@@ -536,13 +611,21 @@ async fn fetch_snapshot_with_token(
     token: &ActiveToken,
     location_id: &str,
 ) -> Result<Option<SnapshotResponse>> {
-    let url = format!(
-        "{}/locations/{location_id}",
-        config.api_url.trim_end_matches('/')
-    );
+    fetch_snapshot_by_api_url_with_token(client, &config.auth, &config.api_url, token, location_id)
+        .await
+}
+
+async fn fetch_snapshot_by_api_url_with_token(
+    client: &Client,
+    auth: &AuthConfig,
+    api_url: &str,
+    token: &ActiveToken,
+    location_id: &str,
+) -> Result<Option<SnapshotResponse>> {
+    let url = format!("{}/locations/{location_id}", api_url.trim_end_matches('/'));
     let response = client
         .get(&url)
-        .header("X-Api-Key", &config.auth.application_key)
+        .header("X-Api-Key", &auth.application_key)
         .header("Authorization", format!("Bearer {}", token.access_token))
         .header("Accept", "application/vnd.api+json")
         .send()
