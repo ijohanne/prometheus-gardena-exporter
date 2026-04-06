@@ -1,0 +1,11 @@
+target/
+result
+result-*
+.direnv/
+.env
+.env.*
+!.envrc
+.pre-commit-config.yaml
+.pre-commit-hooks.yaml
+.DS_Store
+*.log
