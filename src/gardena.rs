@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use prometheus::{
     core::Collector, Counter, CounterVec, Encoder, Gauge, GaugeVec, IntCounter, IntGauge, Opts,
     Registry, TextEncoder,
@@ -13,13 +13,19 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::RwLock;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{protocol::CloseFrame, Message},
+    WebSocketStream,
+};
 use tracing::{debug, info, warn};
 
 pub const DEFAULT_AUTH_URL: &str = "https://api.authentication.husqvarnagroup.dev/v1";
 pub const DEFAULT_API_URL: &str = "https://api.smart.gardena.dev/v2";
 pub const DEFAULT_ESTIMATED_FLOW_LITERS_PER_MINUTE: f64 = 3.5;
+const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
@@ -418,11 +424,16 @@ async fn sync_once(
 
     let mut snapshot_interval = tokio::time::interval(config.snapshot_interval);
     snapshot_interval.tick().await;
+    let mut heartbeat_interval = tokio::time::interval(WEBSOCKET_HEARTBEAT_INTERVAL);
+    heartbeat_interval.tick().await;
 
     loop {
         tokio::select! {
             _ = snapshot_interval.tick() => {
                 ensure_snapshot(client, config, &selected, &mut token, shared_state).await?;
+            }
+            _ = heartbeat_interval.tick() => {
+                send_websocket_heartbeat(&mut stream).await?;
             }
             message = stream.next() => {
                 match message {
@@ -441,14 +452,13 @@ async fn sync_once(
                         state.last_error = None;
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        let detail = frame.map_or_else(
-                            || "no close frame".to_string(),
-                            |close_frame| format!("code={} reason={}", close_frame.code, close_frame.reason),
-                        );
-                        bail!("Gardena websocket closed: {detail}");
+                        return handle_peer_initiated_close(&mut stream, frame).await;
                     }
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
-                        debug!("received Gardena websocket ping/pong");
+                    Some(Ok(Message::Ping(_))) => {
+                        debug!("received Gardena websocket ping");
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        debug!("received Gardena websocket pong");
                     }
                     Some(Ok(Message::Binary(_))) => {
                         debug!("received unexpected binary Gardena websocket frame");
@@ -466,6 +476,40 @@ async fn sync_once(
             }
         }
     }
+}
+
+async fn send_websocket_heartbeat<S>(stream: &mut WebSocketStream<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .send(Message::Ping(Vec::new().into()))
+        .await
+        .context("failed to send Gardena websocket heartbeat ping")
+}
+
+async fn handle_peer_initiated_close<S>(
+    stream: &mut WebSocketStream<S>,
+    frame: Option<CloseFrame>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .flush()
+        .await
+        .context("failed to flush Gardena websocket close handshake")?;
+    Err(anyhow!(
+        "Gardena websocket closed: {}",
+        websocket_close_detail(frame.as_ref())
+    ))
+}
+
+fn websocket_close_detail(frame: Option<&CloseFrame>) -> String {
+    frame.map_or_else(
+        || "no close frame".to_string(),
+        |close_frame| format!("code={} reason={}", close_frame.code, close_frame.reason),
+    )
 }
 
 async fn ensure_locations(
@@ -1725,7 +1769,10 @@ fn resolve_valve_estimated_flow_liters_per_minute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::protocol::frame::coding::CloseCode};
 
     #[test]
     fn applies_common_and_sensor_services_from_snapshot() {
@@ -1834,5 +1881,107 @@ mod tests {
         assert_eq!(usage.estimated_flow_liters_per_minute, Some(1.2));
         assert!((usage.total_open_seconds - 900.0).abs() < 0.001);
         assert!((usage.total_estimated_liters - 18.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn send_websocket_heartbeat_writes_ping_frame_to_server() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test websocket listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test websocket listener should expose a local address");
+
+        let server = tokio::spawn(async move {
+            let (tcp_stream, _) = listener
+                .accept()
+                .await
+                .context("test server should accept a TCP connection")?;
+            let mut websocket = accept_async(tcp_stream)
+                .await
+                .context("test server should upgrade TCP to websocket")?;
+            websocket
+                .next()
+                .await
+                .ok_or_else(|| anyhow!("test server websocket ended unexpectedly"))?
+                .context("test server should receive a websocket frame")
+        });
+
+        let url = format!("ws://{address}");
+        let (mut client, _) = connect_async(&url)
+            .await
+            .expect("test client should connect to websocket server");
+        send_websocket_heartbeat(&mut client)
+            .await
+            .expect("heartbeat ping should be sent");
+
+        match server.await.expect("server task should join") {
+            Ok(Message::Ping(payload)) => assert!(payload.is_empty()),
+            Ok(message) => panic!("expected ping frame, received {message:?}"),
+            Err(error) => panic!("server should receive heartbeat ping: {error:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_peer_initiated_close_flushes_close_reply_to_server() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test websocket listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test websocket listener should expose a local address");
+
+        let server = tokio::spawn(async move {
+            let (tcp_stream, _) = listener
+                .accept()
+                .await
+                .context("test server should accept a TCP connection")?;
+            let mut websocket = accept_async(tcp_stream)
+                .await
+                .context("test server should upgrade TCP to websocket")?;
+            websocket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Away,
+                    reason: "Going away".into(),
+                })))
+                .await
+                .context("test server should send close frame")?;
+            websocket
+                .next()
+                .await
+                .ok_or_else(|| anyhow!("test server websocket ended unexpectedly"))?
+                .context("test server should receive close reply")
+        });
+
+        let url = format!("ws://{address}");
+        let (mut client, _) = connect_async(&url)
+            .await
+            .expect("test client should connect to websocket server");
+        let frame = match client
+            .next()
+            .await
+            .expect("client should receive a websocket frame")
+            .expect("client should decode the websocket frame")
+        {
+            Message::Close(frame) => frame,
+            message => panic!("expected close frame, received {message:?}"),
+        };
+
+        let error = handle_peer_initiated_close(&mut client, frame)
+            .await
+            .expect_err("peer close should terminate the websocket session");
+        assert_eq!(
+            error.to_string(),
+            "Gardena websocket closed: code=1001 reason=Going away"
+        );
+
+        match server.await.expect("server task should join") {
+            Ok(Message::Close(Some(frame))) => {
+                assert_eq!(frame.code, CloseCode::Away);
+                assert_eq!(frame.reason.to_string(), "Going away");
+            }
+            Ok(message) => panic!("expected close reply, received {message:?}"),
+            Err(error) => panic!("server should receive close reply: {error:#}"),
+        }
     }
 }
