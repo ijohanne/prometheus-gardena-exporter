@@ -144,16 +144,14 @@ in
             cfg.estimatedFlowLitersPerMinuteByValve
         );
         wrapper = pkgs.writeShellScript "prometheus-${name}-exporter" ''
-          application_key="$(tr -d '\n' < "$CREDENTIALS_DIRECTORY/application-key")"
-          application_secret="$(tr -d '\n' < "$CREDENTIALS_DIRECTORY/application-secret")"
+          export GARDENA_APPLICATION_KEY="$(tr -d '\n' < "$CREDENTIALS_DIRECTORY/application-key")"
+          export GARDENA_APPLICATION_SECRET="$(tr -d '\n' < "$CREDENTIALS_DIRECTORY/application-secret")"
 
           exec ${getBin package}/bin/prometheus-gardena-exporter serve \
             --listen-address ${cfg.listenAddress} \
             --listen-port ${toString cfg.port} \
             --auth-url ${cfg.authUrl} \
             --api-url ${cfg.apiUrl} \
-            --application-key "$application_key" \
-            --application-secret "$application_secret" \
             ${optionalString (cfg.locationId != null) ''--location-id "${cfg.locationId}"''} \
             --snapshot-interval-seconds ${toString cfg.snapshotIntervalSeconds} \
             --reconnect-delay-seconds ${toString cfg.reconnectDelaySeconds} \
