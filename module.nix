@@ -90,6 +90,13 @@ in
             Fetch an OAuth access token on service start and fail fast if that step does not work.
           '';
         };
+        restartSec = mkOption {
+          type = types.str;
+          default = "30s";
+          description = ''
+            Delay before restarting the service after a failure.
+          '';
+        };
         applicationKeyFile = mkOption {
           type = types.path;
           description = ''
@@ -158,9 +165,11 @@ in
       in
       {
         wantedBy = [ "multi-user.target" ];
-        after = [ "network.target" ];
+        wants = [ "network-online.target" ];
+        after = [ "network-online.target" ];
         serviceConfig = {
           Restart = "always";
+          RestartSec = cfg.restartSec;
           PrivateTmp = true;
           WorkingDirectory = "/tmp";
           DynamicUser = false;

@@ -278,6 +278,7 @@ Example:
       "8c9d0a1b-5555-6666-7777-888888888888" = 6.0;
     };
     validateAuthOnStartup = true;
+    restartSec = "30s";
   };
 }
 ```
